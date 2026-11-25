@@ -42,7 +42,7 @@ enum class Shortcut : uint8_t {
     // Sliders
     GoToLayer, LayerSliderUp, LayerSliderDown, MovesSliderLeft, MovesSliderRight, MovesSliderStart, MovesSliderEnd,
     // Painting tools
-    PaintToolCircle, PaintToolSphere, PaintToolFill, PaintToolGapFill, PaintToolTriangle, PaintToolHeightRange,
+    PaintToolCircle, PaintToolSphere, PaintToolFill, PaintToolGapFill, PaintToolTriangle, PaintToolHeightRange, PaintToolBorderLine,
     // Camera
     ViewDefault, ViewTop, ViewBottom, ViewFront, ViewRear, ViewLeft, ViewRight, ViewPlate, ZoomIn, ZoomOut, Mouse3DSettings,
     // Display

@@ -1069,7 +1069,10 @@ bool GLGizmosManager::on_key(wxKeyEvent& evt)
         // BBS
         else if (m_current == MmSegmentation) {
             GLGizmoMmuSegmentation* mmu_seg = dynamic_cast<GLGizmoMmuSegmentation*>(get_current());
-            if (mmu_seg != nullptr) {
+            if (mmu_seg != nullptr && !evt.HasModifiers() && mmu_seg->on_border_line_key(keyCode)) {
+                processed = true;
+            }
+            else if (mmu_seg != nullptr) {
                 if (keyCode >= WXK_NUMPAD0 && keyCode <= WXK_NUMPAD9) {
                     keyCode = keyCode- WXK_NUMPAD0+'0';
                 }

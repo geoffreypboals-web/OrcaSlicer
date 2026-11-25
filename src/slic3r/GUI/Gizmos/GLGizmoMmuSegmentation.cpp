@@ -72,6 +72,8 @@ void GLGizmoMmuSegmentation::on_opening()
 
 void GLGizmoMmuSegmentation::on_shutdown()
 {
+    // Drawn borders stay in memory for this object until it changes; only the open line ends.
+    border_line_finish();
     m_parent.use_slope(false);
     m_parent.toggle_model_objects_visibility(true);
 }
@@ -153,6 +155,10 @@ bool GLGizmoMmuSegmentation::on_init()
     m_desc["perform_remap"]    = _u8L("Remap filaments");
     m_desc["remap"]            = _L("Remap");
     m_desc["remap_reset"]      = _L("Reset");
+    m_desc["border_line"]       = _L("Border line");
+    m_desc["border_snap"]       = _L("Snap to edges");
+    m_desc["border_clear"]      = _L("Clear borders");
+    m_desc["border_hint"]       = _L("Click points along a colour edge. The line follows sharp edges and grooves; Fill stops at it. Borders are not saved in the project.");
 
     std::pair<wxString, wxString> paint_shortcut            = {_L("Left mouse button"),         m_desc["paint"]};
     std::pair<wxString, wxString> erase_shortcut            = {shift + _L("Left mouse button"), m_desc["erase"]};
@@ -169,6 +175,15 @@ bool GLGizmoMmuSegmentation::on_init()
         paint_shortcut,
         erase_shortcut,
         {ctrl + _L("Mouse wheel"), m_desc["smart_fill_angle"]},
+        toggle_wireframe_shortcut
+    };
+
+    m_shortcuts_border_line = {
+        {_L("Left mouse button"), _L("Add a point")},
+        {shift + _L("Left mouse button"), _L("Remove the nearest segment")},
+        {_L_CONTEXT("Enter", "Keyboard Shortcut") + " / " + _L("Esc"), _L("End the line")},
+        {_L("Backspace"), _L("Remove the newest segment")},
+        {ctrl + _L("Mouse wheel"), m_desc["border_snap"]},
         toggle_wireframe_shortcut
     };
 
@@ -247,9 +262,29 @@ bool GLGizmoMmuSegmentation::on_tool_shortcut(Shortcut shortcut)
     case Shortcut::PaintToolCircle:      m_current_tool = ImGui::CircleButtonIcon; break;
     case Shortcut::PaintToolHeightRange: m_current_tool = ImGui::HeightRangeIcon; break;
     case Shortcut::PaintToolGapFill:     m_current_tool = ImGui::GapFillIcon; break;
+    case Shortcut::PaintToolBorderLine:  m_current_tool = ImGui::BorderLineIcon; break;
     default: return false;
     }
     return true;
+}
+
+bool GLGizmoMmuSegmentation::on_border_line_key(int key_code)
+{
+    if (m_tool_type != ToolType::BORDER_LINE)
+        return false;
+    switch (key_code) {
+    case WXK_RETURN:
+    case WXK_NUMPAD_ENTER:
+        border_line_finish();
+        return true; // used even with no open line, so Enter does nothing else here
+    case WXK_ESCAPE:
+        return border_line_finish(); // no open line: Esc closes the gizmo as usual
+    case WXK_BACK:
+        border_line_undo_segment();
+        return true;
+    default:
+        return false;
+    }
 }
 
 static void render_extruders_combo(const std::string& label,
@@ -314,6 +349,8 @@ void GLGizmoMmuSegmentation::render_tooltip_button(float x, float y)
         case ToolType::SMART_FILL: return m_shortcuts_bucket_fill;
 
         case ToolType::GAP_FILL: return m_shortcuts_gap_fill;
+
+        case ToolType::BORDER_LINE: return m_shortcuts_border_line;
 
         default: return {};
         }
@@ -506,14 +543,14 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
 
     m_imgui->text(m_desc.at("tool_type"));
 
-    std::array<wchar_t, 6> tool_ids;
-    tool_ids = { ImGui::CircleButtonIcon, ImGui::SphereButtonIcon, ImGui::TriangleButtonIcon, ImGui::HeightRangeIcon, ImGui::FillButtonIcon, ImGui::GapFillIcon };
-    std::array<wchar_t, 6> icons;
+    std::array<wchar_t, 7> tool_ids;
+    tool_ids = { ImGui::CircleButtonIcon, ImGui::SphereButtonIcon, ImGui::TriangleButtonIcon, ImGui::HeightRangeIcon, ImGui::FillButtonIcon, ImGui::GapFillIcon, ImGui::BorderLineIcon };
+    std::array<wchar_t, 7> icons;
     if (m_is_dark_mode)
-        icons = { ImGui::CircleButtonDarkIcon, ImGui::SphereButtonDarkIcon, ImGui::TriangleButtonDarkIcon, ImGui::HeightRangeDarkIcon, ImGui::FillButtonDarkIcon, ImGui::GapFillDarkIcon };
+        icons = { ImGui::CircleButtonDarkIcon, ImGui::SphereButtonDarkIcon, ImGui::TriangleButtonDarkIcon, ImGui::HeightRangeDarkIcon, ImGui::FillButtonDarkIcon, ImGui::GapFillDarkIcon, ImGui::BorderLineDarkIcon };
     else
-        icons = { ImGui::CircleButtonIcon, ImGui::SphereButtonIcon, ImGui::TriangleButtonIcon, ImGui::HeightRangeIcon, ImGui::FillButtonIcon, ImGui::GapFillIcon };
-    std::array<wxString, 6> tool_tips = { _L("Circle"), _L("Sphere"), _L("Triangle"), _L("Height Range"), _L("Fill"), _L("Gap Fill") };
+        icons = { ImGui::CircleButtonIcon, ImGui::SphereButtonIcon, ImGui::TriangleButtonIcon, ImGui::HeightRangeIcon, ImGui::FillButtonIcon, ImGui::GapFillIcon, ImGui::BorderLineIcon };
+    std::array<wxString, 7> tool_tips = { _L("Circle"), _L("Sphere"), _L("Triangle"), _L("Height Range"), _L("Fill"), _L("Gap Fill"), _L("Border line") };
     for (int i = 0; i < tool_ids.size(); i++) {
         //std::string  str_label = std::string("");
         //std::wstring btn_name  = icons[i] + boost::nowide::widen(str_label);
@@ -660,6 +697,31 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
         }
     }
 
+    else if (m_current_tool == ImGui::BorderLineIcon) {
+        m_tool_type   = ToolType::BORDER_LINE;
+        m_cursor_type = TriangleSelector::CursorType::POINTER;
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(m_desc["border_snap"]);
+        std::string format_str = std::string("%.f") + I18N::translate_utf8("°", "Face angle threshold,"
+                                                                                "placed after the number with no whitespace in between.");
+        ImGui::SameLine(sliders_left_width);
+        ImGui::PushItemWidth(sliders_width);
+        m_imgui->bbl_slider_float_style("##border_snap", &m_border_snap_angle, BorderSnapAngleMin, BorderSnapAngleMax, format_str.data(), 1.0f, true);
+        ImGui::SameLine(drag_left_width + sliders_left_width);
+        ImGui::PushItemWidth(1.5 * slider_icon_width);
+        ImGui::BBLDragFloat("##border_snap_input", &m_border_snap_angle, 0.05f, 0.0f, 0.0f, "%.f");
+        m_border_snap_angle = std::clamp(m_border_snap_angle, BorderSnapAngleMin, BorderSnapAngleMax);
+        if (ImGui::IsItemHovered())
+            m_imgui->tooltip(_L("Higher: lines hug sharper edges and grooves. 0: straight lines."), max_tooltip_width);
+
+        m_imgui->text_wrapped(m_desc["border_hint"], window_width);
+
+        m_imgui->disabled_begin(!has_border_lines());
+        if (m_imgui->button(m_desc.at("border_clear")))
+            border_line_clear_all();
+        m_imgui->disabled_end();
+    }
+
     ImGui::Separator();
 
     render_tooltip_button(x, y);
@@ -757,6 +819,8 @@ void GLGizmoMmuSegmentation::init_model_triangle_selectors()
         m_triangle_selectors.back()->set_wireframe_needed(true);
         m_volumes_extruder_idxs.push_back(mv->extruder_id());
     }
+    // The selectors were rebuilt (undo/redo, filament change, reopening): put the drawn borders back.
+    border_line_reapply();
 }
 
 void GLGizmoMmuSegmentation::update_triangle_selectors_colors()
@@ -793,6 +857,9 @@ void GLGizmoMmuSegmentation::update_from_model_object(bool first_update)
 
 void GLGizmoMmuSegmentation::tool_changed(wchar_t old_tool, wchar_t new_tool)
 {
+    if (old_tool == ImGui::BorderLineIcon && new_tool != ImGui::BorderLineIcon)
+        border_line_finish();
+
     if ((old_tool == ImGui::GapFillIcon && new_tool == ImGui::GapFillIcon) ||
         (old_tool != ImGui::GapFillIcon && new_tool != ImGui::GapFillIcon))
         return;

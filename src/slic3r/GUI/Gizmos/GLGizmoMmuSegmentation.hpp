@@ -95,6 +95,9 @@ public:
     // BBS
     bool on_number_key_down(int number);
     bool on_tool_shortcut(Shortcut shortcut) override;
+    // Border line tool keys: Enter / Esc end the line, Backspace removes the newest segment.
+    // True if the key was used (only while the Border line tool is selected).
+    bool on_border_line_key(int key_code);
 
 protected:
     // BBS
@@ -180,6 +183,7 @@ private:
     std::vector<std::pair<wxString, wxString>> m_shortcuts_bucket_fill;
     // Contains all shortcuts in the format of {shortcut, description}, e.g. {alt + _L("Left mouse button"), _L("Part_selection")}
     std::vector<std::pair<wxString, wxString>> m_shortcuts_gap_fill;
+    std::vector<std::pair<wxString, wxString>> m_shortcuts_border_line;
 };
 
 } // namespace Slic3r

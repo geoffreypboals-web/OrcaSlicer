@@ -731,6 +731,31 @@ std::vector<GLGizmoPainterBase::ProjectedHeightRange> GLGizmoPainterBase::get_pr
 // concludes that the event was not intended for it, it should return false.
 bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mouse_position, bool shift_down, bool alt_down, bool control_down)
 {
+    // Border line tool: clicks place points (Shift+click removes the nearest segment), the mouse moves the
+    // preview, Ctrl+wheel changes how strongly lines snap to edges. Everything else falls through to the
+    // camera, so dragging still rotates the view.
+    if (m_tool_type == ToolType::BORDER_LINE) {
+        switch (action) {
+        case SLAGizmoEventType::LeftDown:
+            return border_line_click(mouse_position, shift_down);
+        case SLAGizmoEventType::Moving:
+            border_line_hover(mouse_position);
+            return false;
+        case SLAGizmoEventType::MouseWheelUp:
+        case SLAGizmoEventType::MouseWheelDown:
+            if (!control_down)
+                return false;
+            m_border_snap_angle = action == SLAGizmoEventType::MouseWheelDown ? std::max(m_border_snap_angle - 1.f, BorderSnapAngleMin)
+                                                                             : std::min(m_border_snap_angle + 1.f, BorderSnapAngleMax);
+            m_border_hover_vertex = -1; // recompute the preview with the new strength
+            border_line_hover(mouse_position);
+            m_parent.set_as_dirty();
+            return true;
+        default:
+            return false;
+        }
+    }
+
     Vec2d _mouse_position = mouse_position;
     if (action == SLAGizmoEventType::MouseWheelUp
      || action == SLAGizmoEventType::MouseWheelDown) {
@@ -1040,6 +1065,151 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
     return false;
 }
 
+// ---- Border line tool -------------------------------------------------------------------------------------
+
+bool GLGizmoPainterBase::border_line_click(const Vec2d& mouse_position, bool remove)
+{
+    if (m_triangle_selectors.empty())
+        return false;
+    update_raycast_cache(mouse_position, wxGetApp().plater()->get_camera(), mesh_trafo_matrices());
+    if (m_rr.mesh_id < 0 || m_rr.mesh_id >= int(m_triangle_selectors.size()))
+        return false; // missed the object: let the click rotate the view
+    TriangleSelectorGUI& selector = *m_triangle_selectors[m_rr.mesh_id];
+    const int vertex = selector.nearest_original_vertex(int(m_rr.facet), m_rr.hit);
+    if (vertex < 0)
+        return false;
+
+    if (remove) {
+        // Shift+click: delete the segment that passes closest to the clicked point.
+        const Vec3f& point   = selector.original_vertex(vertex);
+        int          nearest = -1;
+        float        best    = std::numeric_limits<float>::max();
+        for (size_t i = 0; i < m_border_segments.size(); ++i) {
+            if (m_border_segments[i].mesh_idx != m_rr.mesh_id)
+                continue;
+            for (int v : m_border_segments[i].vertex_path) {
+                const float d = (selector.original_vertex(v) - point).squaredNorm();
+                if (d < best) {
+                    best    = d;
+                    nearest = int(i);
+                }
+            }
+        }
+        if (nearest >= 0) {
+            m_border_segments.erase(m_border_segments.begin() + nearest);
+            border_line_reapply();
+        }
+        return true;
+    }
+
+    if (m_border_line_vertex >= 0 && m_border_line_mesh == m_rr.mesh_id && vertex != m_border_line_vertex) {
+        std::vector<int> path = selector.snapped_edge_path(m_border_line_vertex, vertex, m_border_snap_angle);
+        if (path.empty())
+            // The cheapest path left the search corridor (e.g. around a deep fold): search wider.
+            path = selector.snapped_edge_path(m_border_line_vertex, vertex, m_border_snap_angle, 20.f);
+        if (path.empty())
+            return true; // the two points aren't connected on this part; keep the line where it was
+        selector.add_fill_border(path);
+        m_border_segments.push_back({ m_rr.mesh_id, selector.original_vertex_count(), std::move(path) });
+        m_border_object_id = m_c->selection_info()->model_object()->id();
+    } else if (m_border_line_vertex >= 0 && m_border_line_mesh != m_rr.mesh_id) {
+        // A click on another part starts a new line there.
+        border_line_finish();
+    }
+
+    m_border_line_mesh    = m_rr.mesh_id;
+    m_border_line_vertex  = vertex;
+    m_border_hover_vertex = -1;
+    selector.set_fill_border_preview({});
+    // A new border changes what Fill would select under the mouse: drop the old hover preview.
+    selector.seed_fill_unselect_all_triangles();
+    selector.request_update_render_data();
+    m_parent.set_as_dirty();
+    return true;
+}
+
+void GLGizmoPainterBase::border_line_hover(const Vec2d& mouse_position)
+{
+    if (m_border_line_vertex < 0 || m_border_line_mesh < 0 || m_border_line_mesh >= int(m_triangle_selectors.size()))
+        return;
+    update_raycast_cache(mouse_position, wxGetApp().plater()->get_camera(), mesh_trafo_matrices());
+    TriangleSelectorGUI& selector = *m_triangle_selectors[m_border_line_mesh];
+    const int vertex = m_rr.mesh_id == m_border_line_mesh ? selector.nearest_original_vertex(int(m_rr.facet), m_rr.hit) : -1;
+    if (vertex == m_border_hover_vertex)
+        return; // same target as last time: keep the preview (paths take ~10 ms, not worth redoing per pixel)
+    m_border_hover_vertex = vertex;
+    if (vertex >= 0 && vertex != m_border_line_vertex)
+        selector.set_fill_border_preview(selector.snapped_edge_path(m_border_line_vertex, vertex, m_border_snap_angle));
+    else
+        selector.set_fill_border_preview({});
+    m_parent.set_as_dirty();
+}
+
+bool GLGizmoPainterBase::border_line_finish()
+{
+    if (m_border_line_vertex < 0)
+        return false;
+    if (m_border_line_mesh >= 0 && m_border_line_mesh < int(m_triangle_selectors.size()))
+        m_triangle_selectors[m_border_line_mesh]->set_fill_border_preview({});
+    m_border_line_mesh    = -1;
+    m_border_line_vertex  = -1;
+    m_border_hover_vertex = -1;
+    m_parent.set_as_dirty();
+    return true;
+}
+
+bool GLGizmoPainterBase::border_line_undo_segment()
+{
+    if (m_border_segments.empty())
+        return false;
+    const BorderSegment last = m_border_segments.back();
+    m_border_segments.pop_back();
+    // If the removed segment ended the open line, the line now continues from where that segment began.
+    if (m_border_line_vertex >= 0 && m_border_line_mesh == last.mesh_idx && !last.vertex_path.empty() &&
+        last.vertex_path.back() == m_border_line_vertex) {
+        m_border_line_vertex  = last.vertex_path.front();
+        m_border_hover_vertex = -1;
+        if (m_border_line_mesh < int(m_triangle_selectors.size()))
+            m_triangle_selectors[m_border_line_mesh]->set_fill_border_preview({});
+    }
+    border_line_reapply();
+    return true;
+}
+
+void GLGizmoPainterBase::border_line_clear_all()
+{
+    m_border_segments.clear();
+    border_line_finish();
+    border_line_reapply();
+}
+
+void GLGizmoPainterBase::border_line_reapply()
+{
+    // Borders belong to one object and to the meshes they were drawn on; drop any that no longer fit.
+    const ModelObject* mo = m_c->selection_info() ? m_c->selection_info()->model_object() : nullptr;
+    if (mo == nullptr || mo->id() != m_border_object_id)
+        m_border_segments.clear();
+    m_border_segments.erase(std::remove_if(m_border_segments.begin(), m_border_segments.end(),
+                                           [this](const BorderSegment& segment) {
+                                               return segment.mesh_idx >= int(m_triangle_selectors.size()) ||
+                                                      m_triangle_selectors[segment.mesh_idx]->original_vertex_count() != segment.mesh_vertex_count;
+                                           }),
+                            m_border_segments.end());
+    if (m_border_line_mesh >= int(m_triangle_selectors.size()) ||
+        (m_border_line_mesh >= 0 && m_border_line_vertex >= int(m_triangle_selectors[m_border_line_mesh]->original_vertex_count())))
+        border_line_finish();
+
+    for (auto& selector : m_triangle_selectors) {
+        selector->clear_fill_borders();
+        selector->request_fill_borders_update();
+        selector->seed_fill_unselect_all_triangles();
+        selector->request_update_render_data();
+    }
+    for (const BorderSegment& segment : m_border_segments)
+        m_triangle_selectors[segment.mesh_idx]->add_fill_border(segment.vertex_path);
+    m_parent.set_as_dirty();
+}
+
 bool GLGizmoPainterBase::on_mouse(const wxMouseEvent &mouse_event)
 {
     // wxCoord == int --> wx/types.h
@@ -1306,6 +1476,7 @@ void TriangleSelectorGUI::render(ImGuiWrapper* imgui, const Transform3d& matrix)
     }
 
     render_paint_contour(matrix);
+    render_fill_borders(matrix);
 
 #ifdef PRUSASLICER_TRIANGLE_SELECTOR_DEBUG
     if (imgui)
@@ -1437,6 +1608,7 @@ void TriangleSelectorPatch::render(ImGuiWrapper* imgui, const Transform3d& matri
     }
 
     render_paint_contour(matrix);
+    render_fill_borders(matrix);
 }
 
 void TriangleSelectorPatch::update_triangles_per_type()
@@ -1964,6 +2136,78 @@ void TriangleSelectorGUI::render_paint_contour(const Transform3d& matrix)
 
         m_paint_contour.render();
 
+        contour_shader->stop_using();
+    }
+
+    if (curr_shader != nullptr)
+        curr_shader->start_using();
+}
+
+void TriangleSelectorGUI::update_fill_border_models()
+{
+    m_border_lines.reset();
+    m_border_preview.reset();
+
+    // Each edge drawn as its own line, between original-mesh vertices (mesh coordinates, like the contour).
+    auto build = [this](GLModel& model, const std::vector<std::pair<int, int>>& edges, const ColorRGBA& color) {
+        if (edges.empty())
+            return;
+        GLModel::Geometry init_data;
+        init_data.format = { GLModel::Geometry::EPrimitiveType::Lines, GLModel::Geometry::EVertexLayout::P3 };
+        init_data.reserve_vertices(2 * edges.size());
+        init_data.reserve_indices(2 * edges.size());
+        init_data.color = color;
+        unsigned int count = 0;
+        for (const auto& [v0, v1] : edges) {
+            init_data.add_vertex(original_vertex(v0));
+            init_data.add_vertex(original_vertex(v1));
+            count += 2;
+            init_data.add_line(count - 2, count - 1);
+        }
+        model.init_from(std::move(init_data));
+    };
+
+    build(m_border_lines, fill_border_edges(), ColorRGBA(1.0f, 0.55f, 0.0f, 1.0f)); // orange: drawn borders
+    std::vector<std::pair<int, int>> preview;
+    for (size_t i = 1; i < m_border_preview_path.size(); ++i)
+        preview.emplace_back(m_border_preview_path[i - 1], m_border_preview_path[i]);
+    build(m_border_preview, preview, ColorRGBA(1.0f, 1.0f, 0.0f, 1.0f)); // yellow: the segment being placed
+    m_fill_borders_dirty = false;
+}
+
+void TriangleSelectorGUI::render_fill_borders(const Transform3d& matrix)
+{
+    if (m_fill_borders_dirty)
+        update_fill_border_models();
+    if (!m_border_lines.is_initialized() && !m_border_preview.is_initialized())
+        return;
+
+    auto* curr_shader = wxGetApp().get_current_shader();
+    if (curr_shader != nullptr)
+        curr_shader->stop_using();
+
+    // Same shader and depth offset as the paint contour, so the lines sit on the surface.
+    auto* contour_shader = wxGetApp().get_shader("mm_contour");
+    if (contour_shader != nullptr) {
+        contour_shader->start_using();
+        contour_shader->set_uniform("offset", OpenGLManager::get_gl_info().is_mesa() ? 0.0005 : 0.00001);
+        const Camera& camera = wxGetApp().plater()->get_camera();
+        contour_shader->set_uniform("view_model_matrix", camera.get_view_matrix() * matrix);
+        contour_shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+        // Thicker than the 1-pixel contour where the driver allows it (not in core profiles or OpenGL ES).
+#if !SLIC3R_OPENGL_ES
+        const bool wide_lines = !OpenGLManager::get_gl_info().is_core_profile();
+        if (wide_lines)
+            glsafe(::glLineWidth(3.0f));
+#endif // !SLIC3R_OPENGL_ES
+        if (m_border_lines.is_initialized())
+            m_border_lines.render();
+        if (m_border_preview.is_initialized())
+            m_border_preview.render();
+#if !SLIC3R_OPENGL_ES
+        if (wide_lines)
+            glsafe(::glLineWidth(1.0f));
+#endif // !SLIC3R_OPENGL_ES
         contour_shader->stop_using();
     }
 

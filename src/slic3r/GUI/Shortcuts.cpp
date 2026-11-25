@@ -138,6 +138,7 @@ constexpr std::array<ShortcutInfo, size_t(Shortcut::Count)> shortcut_table = {{
     SHORTCUT(PaintToolGapFill,     "paint_tool_gap_fill",     L("Gap Fill"),                                     PAINTING, { 'G' }),
     SHORTCUT(PaintToolTriangle,    "paint_tool_triangle",     L("Triangle"),                                     PAINTING, { 'T' }),
     SHORTCUT(PaintToolHeightRange, "paint_tool_height_range", L("Height Range"),                                 PAINTING, { 'H' }),
+    SHORTCUT(PaintToolBorderLine,  "paint_tool_border_line",  L("Border line"),                                  PAINTING, { 'L' }),
 
     // Camera
     SHORTCUT(ViewDefault,       "view_default",       L("Camera view - Default"),                                GLOBAL, { '0', CTRL }),

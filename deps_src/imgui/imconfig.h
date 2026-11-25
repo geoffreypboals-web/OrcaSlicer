@@ -229,6 +229,10 @@ namespace ImGui
     const wchar_t OpenHoverButton      = 0x085A;
     const wchar_t OpenHoverDarkButton  = 0x085B;
 
+    // Colour painting: Border line tool
+    const wchar_t BorderLineIcon       = 0x0860;
+    const wchar_t BorderLineDarkIcon   = 0x0861;
+
     //    void MyFunction(const char* name, const MyMatrix44& v);
 
     const wchar_t FilamentGreen     = 0x0850;

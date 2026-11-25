@@ -393,6 +393,8 @@ public:
     int nearest_original_vertex(int facet_idx, const Vec3f &point) const;
     // Position of an original-mesh vertex (mesh coordinates).
     const Vec3f &original_vertex(int vertex_idx) const { return m_mesh.its.vertices[vertex_idx]; }
+    // Number of vertices of the original mesh (valid vertex indices for the border functions are below this).
+    size_t original_vertex_count() const { return m_mesh.its.vertices.size(); }
 
     bool                 has_facets(EnforcerBlockerType state) const;
     static bool          has_facets(const TriangleSplittingData &data, EnforcerBlockerType test_state);

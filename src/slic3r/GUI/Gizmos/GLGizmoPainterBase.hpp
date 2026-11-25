@@ -51,6 +51,12 @@ public:
     // The seed-fill contour alone, as render() last built it - for a gizmo that draws over the selector
     // and has to put the contour back on top.
     void         render_paint_contour(const Transform3d& matrix);
+
+    // Border line tool: draws the fill borders and the line being drawn (the preview) on the surface.
+    // Call request_fill_borders_update() after changing borders or the preview.
+    void         set_fill_border_preview(std::vector<int> vertex_path) { m_border_preview_path = std::move(vertex_path); m_fill_borders_dirty = true; }
+    void         request_fill_borders_update() { m_fill_borders_dirty = true; }
+    void         render_fill_borders(const Transform3d& matrix);
     //void         render(const Transform3d& matrix) { this->render(nullptr, matrix); }
     void         set_wireframe_needed(bool need_wireframe) { m_need_wireframe = need_wireframe; }
     bool         get_wireframe_needed() { return m_need_wireframe; }
@@ -95,6 +101,14 @@ protected:
     void update_paint_contour();
 
     bool                                m_need_wireframe {false};
+
+private:
+    // Border line tool drawing data (see render_fill_borders).
+    GLModel          m_border_lines;
+    GLModel          m_border_preview;
+    std::vector<int> m_border_preview_path;
+    bool             m_fill_borders_dirty {true};
+    void             update_fill_border_models();
 };
 
 // BBS
@@ -277,7 +291,40 @@ protected:
         SMART_FILL,
         // BBS
         GAP_FILL,
+        // Border line: click points on the surface; the line between them snaps to sharp edges and grooves,
+        // and Fill never crosses it.
+        BORDER_LINE,
     };
+
+    // Border line tool. One drawn segment = the snapped edge path between two clicked vertices.
+    struct BorderSegment
+    {
+        int              mesh_idx;
+        size_t           mesh_vertex_count; // to drop segments if the part's mesh changed
+        std::vector<int> vertex_path;       // original-mesh vertex indices
+    };
+    std::vector<BorderSegment> m_border_segments;          // every drawn segment, oldest first
+    ObjectID                   m_border_object_id;        // object the segments belong to
+    int                        m_border_line_mesh   = -1; // part the open line is on
+    int                        m_border_line_vertex = -1; // last clicked vertex of the open line, -1 = no open line
+    int                        m_border_hover_vertex = -1;
+    float                      m_border_snap_angle  = 20.f; // degrees; 0 = straight (shortest) lines
+    static constexpr float     BorderSnapAngleMin   = 0.f;
+    static constexpr float     BorderSnapAngleMax   = 60.f;
+
+    // Click handling for the border line tool; true if the click was used.
+    bool border_line_click(const Vec2d& mouse_position, bool remove);
+    // Updates the preview from the open line's last point to the vertex under the mouse.
+    void border_line_hover(const Vec2d& mouse_position);
+    // Ends the open line (Enter / Esc / changing tool). True if a line was open.
+    bool border_line_finish();
+    // Removes the newest segment (Backspace). True if one was removed.
+    bool border_line_undo_segment();
+    // Removes every border on every part.
+    void border_line_clear_all();
+    // Re-applies m_border_segments to the selectors (after they were rebuilt, or after a removal).
+    void border_line_reapply();
+    bool has_border_lines() const { return !m_border_segments.empty(); }
 
     struct ProjectedMousePosition
     {
