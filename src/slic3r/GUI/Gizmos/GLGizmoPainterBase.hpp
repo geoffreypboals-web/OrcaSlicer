@@ -57,6 +57,10 @@ public:
     void         set_fill_border_preview(std::vector<int> vertex_path) { m_border_preview_path = std::move(vertex_path); m_fill_borders_dirty = true; }
     void         request_fill_borders_update() { m_fill_borders_dirty = true; }
     void         render_fill_borders(const Transform3d& matrix);
+    // Border ribbons: width in screen pixels (2..12), shared by all parts; set from the gizmo panel.
+    static float border_line_width;
+    static constexpr float BorderLineWidthMin = 2.f;
+    static constexpr float BorderLineWidthMax = 12.f;
     //void         render(const Transform3d& matrix) { this->render(nullptr, matrix); }
     void         set_wireframe_needed(bool need_wireframe) { m_need_wireframe = need_wireframe; }
     bool         get_wireframe_needed() { return m_need_wireframe; }
@@ -108,7 +112,10 @@ private:
     GLModel          m_border_preview;
     std::vector<int> m_border_preview_path;
     bool             m_fill_borders_dirty {true};
+    std::vector<Vec3f> m_border_vertex_normals; // per original vertex, for lifting the ribbons off the surface
     void             update_fill_border_models();
+    // An original vertex lifted 0.05 mm along its normal, so the ribbon isn't hidden by the surface it lies on.
+    Vec3f            lifted_vertex(int vertex_idx);
 };
 
 // BBS
@@ -309,6 +316,8 @@ protected:
     int                        m_border_line_vertex = -1; // last clicked vertex of the open line, -1 = no open line
     int                        m_border_hover_vertex = -1;
     float                      m_border_snap_angle  = 20.f; // degrees; 0 = straight (shortest) lines
+    bool                       m_border_fill_area_mode = false; // "Click to: Fill area" (Alt+click does it too)
+    bool                       m_border_area_preview   = false; // a Fill area hover highlight is showing
     static constexpr float     BorderSnapAngleMin   = 0.f;
     static constexpr float     BorderSnapAngleMax   = 60.f;
 
@@ -324,6 +333,12 @@ protected:
     void border_line_clear_all();
     // Re-applies m_border_segments to the selectors (after they were rebuilt, or after a removal).
     void border_line_reapply();
+    // Fill area: paints everything on the clicked side of the borders with the selected filament, over existing
+    // paint and sharp edges (one undo step). True if the click hit the object.
+    bool border_fill_area_click(const Vec2d& mouse_position);
+    // Highlights what a Fill area click would paint.
+    void border_fill_area_hover(const Vec2d& mouse_position);
+    void border_fill_area_clear_preview();
     bool has_border_lines() const { return !m_border_segments.empty(); }
 
     struct ProjectedMousePosition

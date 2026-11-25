@@ -159,6 +159,11 @@ bool GLGizmoMmuSegmentation::on_init()
     m_desc["border_snap"]       = _L("Snap to edges");
     m_desc["border_clear"]      = _L("Clear borders");
     m_desc["border_hint"]       = _L("Click points along a colour edge. The line follows sharp edges and grooves; Fill stops at it. Borders are not saved in the project.");
+    m_desc["border_click_to"]   = _L("Click to");
+    m_desc["border_draw"]       = _L("Draw border");
+    m_desc["border_fill_area"]  = _L("Fill area");
+    m_desc["border_width"]      = _L("Line width");
+    m_desc["border_area_hint"]  = _L("Click a side of your borders to paint all of it with the selected filament, over old paint and sharp edges. With no closed border the whole part is painted. Ctrl+Z undoes it.");
 
     std::pair<wxString, wxString> paint_shortcut            = {_L("Left mouse button"),         m_desc["paint"]};
     std::pair<wxString, wxString> erase_shortcut            = {shift + _L("Left mouse button"), m_desc["erase"]};
@@ -181,6 +186,7 @@ bool GLGizmoMmuSegmentation::on_init()
     m_shortcuts_border_line = {
         {_L("Left mouse button"), _L("Add a point")},
         {shift + _L("Left mouse button"), _L("Remove the nearest segment")},
+        {alt + _L("Left mouse button"), _L("Fill area: paint the clicked side of the borders")},
         {_L_CONTEXT("Enter", "Keyboard Shortcut") + " / " + _L("Esc"), _L("End the line")},
         {_L("Backspace"), _L("Remove the newest segment")},
         {ctrl + _L("Mouse wheel"), m_desc["border_snap"]},
@@ -714,7 +720,37 @@ void GLGizmoMmuSegmentation::on_render_input_window(float x, float y, float bott
         if (ImGui::IsItemHovered())
             m_imgui->tooltip(_L("Higher: lines hug sharper edges and grooves. 0: straight lines."), max_tooltip_width);
 
-        m_imgui->text_wrapped(m_desc["border_hint"], window_width);
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(m_desc["border_width"]);
+        ImGui::SameLine(sliders_left_width);
+        ImGui::PushItemWidth(sliders_width);
+        m_imgui->bbl_slider_float_style("##border_width", &TriangleSelectorGUI::border_line_width, TriangleSelectorGUI::BorderLineWidthMin,
+                                        TriangleSelectorGUI::BorderLineWidthMax, "%.f px", 1.0f, true);
+        ImGui::SameLine(drag_left_width + sliders_left_width);
+        ImGui::PushItemWidth(1.5 * slider_icon_width);
+        ImGui::BBLDragFloat("##border_width_input", &TriangleSelectorGUI::border_line_width, 0.05f, 0.0f, 0.0f, "%.f");
+        TriangleSelectorGUI::border_line_width = std::clamp(TriangleSelectorGUI::border_line_width, TriangleSelectorGUI::BorderLineWidthMin,
+                                                            TriangleSelectorGUI::BorderLineWidthMax);
+
+        // "Click to": draw border lines, or paint a whole side of them (Alt+click does that too).
+        ImGui::AlignTextToFramePadding();
+        m_imgui->text(m_desc["border_click_to"]);
+        ImGui::SameLine(sliders_left_width);
+        bool fill_area = m_border_fill_area_mode;
+        if (ImGui::RadioButton(m_desc["border_draw"].ToUTF8().data(), !fill_area))
+            fill_area = false;
+        ImGui::SameLine();
+        if (ImGui::RadioButton(m_desc["border_fill_area"].ToUTF8().data(), fill_area))
+            fill_area = true;
+        if (fill_area != m_border_fill_area_mode) {
+            m_border_fill_area_mode = fill_area;
+            if (fill_area)
+                border_line_finish(); // an open line ends when you start filling
+            else
+                border_fill_area_clear_preview();
+        }
+
+        m_imgui->text_wrapped(m_border_fill_area_mode ? m_desc["border_area_hint"] : m_desc["border_hint"], window_width);
 
         m_imgui->disabled_begin(!has_border_lines());
         if (m_imgui->button(m_desc.at("border_clear")))
@@ -857,8 +893,10 @@ void GLGizmoMmuSegmentation::update_from_model_object(bool first_update)
 
 void GLGizmoMmuSegmentation::tool_changed(wchar_t old_tool, wchar_t new_tool)
 {
-    if (old_tool == ImGui::BorderLineIcon && new_tool != ImGui::BorderLineIcon)
+    if (old_tool == ImGui::BorderLineIcon && new_tool != ImGui::BorderLineIcon) {
         border_line_finish();
+        border_fill_area_clear_preview();
+    }
 
     if ((old_tool == ImGui::GapFillIcon && new_tool == ImGui::GapFillIcon) ||
         (old_tool != ImGui::GapFillIcon && new_tool != ImGui::GapFillIcon))

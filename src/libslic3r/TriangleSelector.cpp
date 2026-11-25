@@ -546,7 +546,7 @@ void TriangleSelector::append_touching_edges(int itriangle, int vertexi, int ver
 }
 
 // BBS: add seed_fill_angle parameter
-void TriangleSelector::bucket_fill_select_triangles(const Vec3f& hit, int facet_start, const ClippingPlane &clp, float seed_fill_angle, bool propagate, bool force_reselection)
+void TriangleSelector::bucket_fill_select_triangles(const Vec3f& hit, int facet_start, const ClippingPlane &clp, float seed_fill_angle, bool propagate, bool force_reselection, bool cross_paint)
 {
     int start_facet_idx = select_unsplit_triangle(hit, facet_start);
     assert(start_facet_idx != -1);
@@ -597,7 +597,7 @@ void TriangleSelector::bucket_fill_select_triangles(const Vec3f& hit, int facet_
 
             std::vector<int> touching_triangles = get_all_touching_triangles(current_facet, neighbors[current_facet], neighbors_propagated[current_facet]);
             for(const int tr_idx : touching_triangles) {
-                if (tr_idx < 0 || visited[tr_idx] || m_triangles[tr_idx].get_state() != start_facet_state || is_facet_clipped(tr_idx, clp))
+                if (tr_idx < 0 || visited[tr_idx] || (!cross_paint && m_triangles[tr_idx].get_state() != start_facet_state) || is_facet_clipped(tr_idx, clp))
                     continue;
 
                 const Vec3f& n1 = m_face_normals[m_triangles[tr_idx].source_triangle];

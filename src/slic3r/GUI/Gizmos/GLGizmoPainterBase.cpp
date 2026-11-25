@@ -738,9 +738,16 @@ bool GLGizmoPainterBase::gizmo_event(SLAGizmoEventType action, const Vec2d& mous
     if (m_tool_type == ToolType::BORDER_LINE) {
         switch (action) {
         case SLAGizmoEventType::LeftDown:
+            if (m_border_fill_area_mode || alt_down)
+                return border_fill_area_click(mouse_position);
             return border_line_click(mouse_position, shift_down);
         case SLAGizmoEventType::Moving:
-            border_line_hover(mouse_position);
+            if (m_border_fill_area_mode || alt_down) {
+                border_fill_area_hover(mouse_position);
+            } else {
+                border_fill_area_clear_preview();
+                border_line_hover(mouse_position);
+            }
             return false;
         case SLAGizmoEventType::MouseWheelUp:
         case SLAGizmoEventType::MouseWheelDown:
@@ -1146,6 +1153,66 @@ void GLGizmoPainterBase::border_line_hover(const Vec2d& mouse_position)
         selector.set_fill_border_preview(selector.snapped_edge_path(m_border_line_vertex, vertex, m_border_snap_angle));
     else
         selector.set_fill_border_preview({});
+    m_parent.set_as_dirty();
+}
+
+bool GLGizmoPainterBase::border_fill_area_click(const Vec2d& mouse_position)
+{
+    if (m_triangle_selectors.empty())
+        return false;
+    const std::vector<Transform3d> trafo_matrices = mesh_trafo_matrices();
+    update_raycast_cache(mouse_position, wxGetApp().plater()->get_camera(), trafo_matrices);
+    if (m_rr.mesh_id < 0 || m_rr.mesh_id >= int(m_triangle_selectors.size()))
+        return false;
+    TriangleSelectorGUI& selector = *m_triangle_selectors[m_rr.mesh_id];
+    const TriangleSelector::ClippingPlane clp = get_clipping_plane_in_volume_coordinates(trafo_matrices[m_rr.mesh_id]);
+
+    // The snapshot holds the paint as it was, so one Ctrl+Z undoes the whole fill.
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), _u8L("Fill area"), UndoRedo::SnapshotType::GizmoAction);
+    selector.seed_fill_unselect_all_triangles();
+    // Angle -1: no edge detection. cross_paint: don't stop at existing colours. Only borders and open edges stop it.
+    selector.bucket_fill_select_triangles(m_rr.hit, int(m_rr.facet), clp, -1.f, true, true, true);
+    selector.seed_fill_apply_on_triangles(get_left_button_state_type());
+    selector.request_update_render_data(true);
+    m_border_area_preview = false;
+    update_model_object();
+    m_parent.set_as_dirty();
+    return true;
+}
+
+void GLGizmoPainterBase::border_fill_area_hover(const Vec2d& mouse_position)
+{
+    if (m_triangle_selectors.empty())
+        return;
+    const std::vector<Transform3d> trafo_matrices = mesh_trafo_matrices();
+    update_raycast_cache(mouse_position, wxGetApp().plater()->get_camera(), trafo_matrices);
+    if (m_rr.mesh_id < 0 || m_rr.mesh_id >= int(m_triangle_selectors.size())) {
+        border_fill_area_clear_preview();
+        return;
+    }
+    for (int i = 0; i < int(m_triangle_selectors.size()); ++i)
+        if (i != m_rr.mesh_id && m_border_area_preview) {
+            m_triangle_selectors[i]->seed_fill_unselect_all_triangles();
+            m_triangle_selectors[i]->request_update_render_data();
+        }
+    TriangleSelectorGUI& selector = *m_triangle_selectors[m_rr.mesh_id];
+    // Without force_reselection the fill is only recomputed when the mouse leaves the highlighted area.
+    selector.bucket_fill_select_triangles(m_rr.hit, int(m_rr.facet), get_clipping_plane_in_volume_coordinates(trafo_matrices[m_rr.mesh_id]),
+                                          -1.f, true, false, true);
+    selector.request_update_render_data();
+    m_border_area_preview = true;
+    m_parent.set_as_dirty();
+}
+
+void GLGizmoPainterBase::border_fill_area_clear_preview()
+{
+    if (!m_border_area_preview)
+        return;
+    for (auto& selector : m_triangle_selectors) {
+        selector->seed_fill_unselect_all_triangles();
+        selector->request_update_render_data();
+    }
+    m_border_area_preview = false;
     m_parent.set_as_dirty();
 }
 
@@ -2151,6 +2218,25 @@ void TriangleSelectorGUI::render_paint_contour(const Transform3d& matrix)
         curr_shader->start_using();
 }
 
+float TriangleSelectorGUI::border_line_width = 4.f;
+
+Vec3f TriangleSelectorGUI::lifted_vertex(int vertex_idx)
+{
+    if (m_border_vertex_normals.size() != original_vertex_count()) {
+        // Area-weighted vertex normals of the original mesh (face normals are unit; the cross product carries area).
+        m_border_vertex_normals.assign(original_vertex_count(), Vec3f::Zero());
+        for (const stl_triangle_vertex_indices& tri : m_mesh.its.indices) {
+            const Vec3f n = (m_mesh.its.vertices[tri[1]] - m_mesh.its.vertices[tri[0]]).cross(m_mesh.its.vertices[tri[2]] - m_mesh.its.vertices[tri[0]]);
+            for (int k = 0; k < 3; ++k)
+                m_border_vertex_normals[tri[k]] += n;
+        }
+        for (Vec3f& n : m_border_vertex_normals)
+            if (n.squaredNorm() > 0.f)
+                n.normalize();
+    }
+    return original_vertex(vertex_idx) + 0.05f * m_border_vertex_normals[vertex_idx];
+}
+
 void TriangleSelectorGUI::update_fill_border_models()
 {
     m_border_lines.reset();
@@ -2167,19 +2253,19 @@ void TriangleSelectorGUI::update_fill_border_models()
         init_data.color = color;
         unsigned int count = 0;
         for (const auto& [v0, v1] : edges) {
-            init_data.add_vertex(original_vertex(v0));
-            init_data.add_vertex(original_vertex(v1));
+            init_data.add_vertex(lifted_vertex(v0));
+            init_data.add_vertex(lifted_vertex(v1));
             count += 2;
             init_data.add_line(count - 2, count - 1);
         }
         model.init_from(std::move(init_data));
     };
 
-    build(m_border_lines, fill_border_edges(), ColorRGBA(1.0f, 0.55f, 0.0f, 1.0f)); // orange: drawn borders
+    build(m_border_lines, fill_border_edges(), ColorRGBA(0.0f, 0.9f, 1.0f, 1.0f)); // cyan: drawn borders
     std::vector<std::pair<int, int>> preview;
     for (size_t i = 1; i < m_border_preview_path.size(); ++i)
         preview.emplace_back(m_border_preview_path[i - 1], m_border_preview_path[i]);
-    build(m_border_preview, preview, ColorRGBA(1.0f, 1.0f, 0.0f, 1.0f)); // yellow: the segment being placed
+    build(m_border_preview, preview, ColorRGBA(1.0f, 0.0f, 1.0f, 1.0f)); // magenta: the segment being placed
     m_fill_borders_dirty = false;
 }
 
@@ -2194,29 +2280,55 @@ void TriangleSelectorGUI::render_fill_borders(const Transform3d& matrix)
     if (curr_shader != nullptr)
         curr_shader->stop_using();
 
-    // Same shader and depth offset as the paint contour, so the lines sit on the surface.
-    auto* contour_shader = wxGetApp().get_shader("mm_contour");
-    if (contour_shader != nullptr) {
-        contour_shader->start_using();
-        contour_shader->set_uniform("offset", OpenGLManager::get_gl_info().is_mesa() ? 0.0005 : 0.00001);
+    // Ribbons: the core profile draws thick lines with the dashed_thick_lines geometry shader (as the selection box
+    // does); the compatibility profile uses glLineWidth. OpenGL ES has neither and gets 1-pixel lines.
+#if SLIC3R_OPENGL_ES
+    const bool core = false;
+    GLShaderProgram* shader = wxGetApp().get_shader("flat");
+#else
+    const bool core = OpenGLManager::get_gl_info().is_core_profile();
+    GLShaderProgram* shader = wxGetApp().get_shader(core ? "dashed_thick_lines" : "flat");
+#endif // SLIC3R_OPENGL_ES
+    if (shader != nullptr) {
+        shader->start_using();
         const Camera& camera = wxGetApp().plater()->get_camera();
-        contour_shader->set_uniform("view_model_matrix", camera.get_view_matrix() * matrix);
-        contour_shader->set_uniform("projection_matrix", camera.get_projection_matrix());
-        // Thicker than the 1-pixel contour where the driver allows it (not in core profiles or OpenGL ES).
+        shader->set_uniform("view_model_matrix", camera.get_view_matrix() * matrix);
+        shader->set_uniform("projection_matrix", camera.get_projection_matrix());
+        if (core) {
+            const std::array<int, 4>& viewport = camera.get_viewport();
+            shader->set_uniform("viewport_size", Vec2d(double(viewport[2]), double(viewport[3])));
+            shader->set_uniform("gap_size", 0.0f);
+        }
+        // Two passes: a dark outline 4 px wider, then the colour on top (LEQUAL so the second pass draws at the
+        // same depth). The outline keeps the line visible on any paint colour.
+        GLint old_depth_func = GL_LESS;
+        glsafe(::glGetIntegerv(GL_DEPTH_FUNC, &old_depth_func));
+        glsafe(::glDepthFunc(GL_LEQUAL));
+        const float scale = wxGetApp().plater()->get_current_canvas3D()->get_scale();
+        for (int pass = 0; pass < 2; ++pass) {
+            const float width = (border_line_width + (pass == 0 ? 4.f : 0.f)) * scale;
+            if (core)
+                shader->set_uniform("width", width);
 #if !SLIC3R_OPENGL_ES
-        const bool wide_lines = !OpenGLManager::get_gl_info().is_core_profile();
-        if (wide_lines)
-            glsafe(::glLineWidth(3.0f));
+            else
+                glsafe(::glLineWidth(width));
 #endif // !SLIC3R_OPENGL_ES
-        if (m_border_lines.is_initialized())
-            m_border_lines.render();
-        if (m_border_preview.is_initialized())
-            m_border_preview.render();
+            for (GLModel* model : { &m_border_lines, &m_border_preview }) {
+                if (!model->is_initialized())
+                    continue;
+                const ColorRGBA color = model->get_color();
+                if (pass == 0)
+                    model->set_color(ColorRGBA(0.05f, 0.05f, 0.05f, 1.0f));
+                model->render();
+                model->set_color(color);
+            }
+        }
 #if !SLIC3R_OPENGL_ES
-        if (wide_lines)
+        if (!core)
             glsafe(::glLineWidth(1.0f));
 #endif // !SLIC3R_OPENGL_ES
-        contour_shader->stop_using();
+        glsafe(::glDepthFunc(GLenum(old_depth_func)));
+        shader->stop_using();
     }
 
     if (curr_shader != nullptr)

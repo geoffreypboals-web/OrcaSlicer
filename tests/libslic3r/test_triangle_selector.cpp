@@ -288,6 +288,62 @@ TEST_CASE("Bucket fill stops at a closed fill border", "[TriangleSelector][Borde
     }
 }
 
+TEST_CASE("Fill area crosses existing paint and stops only at borders", "[TriangleSelector][BorderLine]")
+{
+    const int   n    = 21; // 20 x 20 cells of 1 mm = 800 triangles
+    const float cell = 1.f;
+    const TriangleMesh mesh = grid_mesh(n, cell);
+    TriangleSelector   selector(mesh);
+    const auto centre_of = [&mesh](int t) {
+        const auto &tri = mesh.its.indices[t];
+        return Vec3f((mesh.its.vertices[tri[0]] + mesh.its.vertices[tri[1]] + mesh.its.vertices[tri[2]]) / 3.f);
+    };
+    const auto inside = [&](int t) { const Vec3f c = centre_of(t); return c.x() > 5.f && c.x() < 15.f && c.y() > 5.f && c.y() < 15.f; };
+    // Stripes of an old colour on every other column, inside and outside the square.
+    auto paint_stripes = [&]() {
+        for (int t = 0; t < int(mesh.its.indices.size()); ++t)
+            if (int(std::floor(centre_of(t).x())) % 2 == 0)
+                selector.set_facet(t, EnforcerBlockerType::Extruder3);
+    };
+    // The triangle under (11.5, 10.5): column 11, which is not striped.
+    int start = 0;
+    for (int t = 0; t < int(mesh.its.indices.size()); ++t)
+        if ((centre_of(t) - Vec3f(11.5f, 10.5f, 0.f)).norm() < (centre_of(start) - Vec3f(11.5f, 10.5f, 0.f)).norm())
+            start = t;
+    auto fill_area = [&](bool cross_paint) {
+        selector.seed_fill_unselect_all_triangles();
+        selector.bucket_fill_select_triangles(centre_of(start), start, TriangleSelector::ClippingPlane(), -1.f, true, true, cross_paint);
+        selector.seed_fill_apply_on_triangles(EnforcerBlockerType::Extruder2);
+    };
+    int striped_outside = 0;
+    for (int t = 0; t < int(mesh.its.indices.size()); ++t)
+        striped_outside += !inside(t) && int(std::floor(centre_of(t).x())) % 2 == 0;
+
+    SECTION("without a border it paints the whole part") {
+        paint_stripes();
+        fill_area(true);
+        CHECK(selector.num_facets(EnforcerBlockerType::Extruder2) == 800);
+    }
+    SECTION("with a closed border it paints exactly the clicked side") {
+        std::vector<int> loop;
+        for (int i = 5; i <= 15; ++i) loop.push_back(grid_vertex(n, cell, float(i), 5.f));
+        for (int j = 6; j <= 15; ++j) loop.push_back(grid_vertex(n, cell, 15.f, float(j)));
+        for (int i = 14; i >= 5; --i) loop.push_back(grid_vertex(n, cell, float(i), 15.f));
+        for (int j = 14; j >= 5; --j) loop.push_back(grid_vertex(n, cell, 5.f, float(j)));
+        selector.add_fill_border(loop);
+        paint_stripes();
+        fill_area(true);
+        CHECK(selector.num_facets(EnforcerBlockerType::Extruder2) == 200);        // the whole inside, stripes included
+        CHECK(selector.num_facets(EnforcerBlockerType::Extruder3) == striped_outside); // outside untouched
+
+        // Ordinary Fill (cross_paint = false) stops at the stripes instead.
+        selector.reset();
+        paint_stripes();
+        fill_area(false);
+        CHECK(selector.num_facets(EnforcerBlockerType::Extruder2) < 200);
+    }
+}
+
 TEST_CASE("Fill borders do not change serialized paint", "[TriangleSelector][BorderLine]")
 {
     const TriangleMesh mesh = grid_mesh(11, 1.f);
