@@ -16,6 +16,7 @@
 #include "slic3r/GUI/Camera.hpp"
 #include "slic3r/GUI/Plater.hpp"
 #include "slic3r/GUI/OpenGLManager.hpp"
+#include "slic3r/GUI/NotificationManager.hpp"
 #include "slic3r/Utils/UndoRedo.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -1107,8 +1108,11 @@ bool GLGizmoPainterBase::border_line_click(const Vec2d& mouse_position, bool rem
         if (path.empty())
             // The cheapest path left the search corridor (e.g. around a deep fold): search wider.
             path = selector.snapped_edge_path(m_border_line_vertex, vertex, m_border_snap_angle, 20.f);
-        if (path.empty())
-            return true; // the two points aren't connected on this part; keep the line where it was
+        if (path.empty()) {
+            // The two points aren't connected on this part: keep the line where it was.
+            wxGetApp().plater()->get_notification_manager()->push_notification(_u8L("Border line: no path along the surface between these points."));
+            return true;
+        }
         selector.add_fill_border(path);
         m_border_segments.push_back({ m_rr.mesh_id, selector.original_vertex_count(), std::move(path) });
         m_border_object_id = m_c->selection_info()->model_object()->id();
@@ -1188,13 +1192,17 @@ void GLGizmoPainterBase::border_line_reapply()
     // Borders belong to one object and to the meshes they were drawn on; drop any that no longer fit.
     const ModelObject* mo = m_c->selection_info() ? m_c->selection_info()->model_object() : nullptr;
     if (mo == nullptr || mo->id() != m_border_object_id)
-        m_border_segments.clear();
+        m_border_segments.clear(); // another object: its borders were never drawn here, nothing to report
+    const size_t before = m_border_segments.size();
     m_border_segments.erase(std::remove_if(m_border_segments.begin(), m_border_segments.end(),
                                            [this](const BorderSegment& segment) {
                                                return segment.mesh_idx >= int(m_triangle_selectors.size()) ||
                                                       m_triangle_selectors[segment.mesh_idx]->original_vertex_count() != segment.mesh_vertex_count;
                                            }),
                             m_border_segments.end());
+    if (m_border_segments.size() != before)
+        wxGetApp().plater()->get_notification_manager()->push_notification(
+            _u8L("Border line: the part's mesh changed, so borders drawn on it were removed."));
     if (m_border_line_mesh >= int(m_triangle_selectors.size()) ||
         (m_border_line_mesh >= 0 && m_border_line_vertex >= int(m_triangle_selectors[m_border_line_mesh]->original_vertex_count())))
         border_line_finish();
