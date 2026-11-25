@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <limits>
+#include <unordered_map>
 #include <memory>
 #include <optional>
 #include <tbb/parallel_for.h>
@@ -603,6 +605,11 @@ void TriangleSelector::bucket_fill_select_triangles(const Vec3f& hit, int facet_
                 if (seed_fill_angle >= -EPSILON && std::clamp(n1.dot(n2), 0.f, 1.f) < facet_angle_limit)
                     continue;
 
+                // Border line tool: never cross an edge the user marked as a colour border.
+                if (!m_fill_borders.empty() &&
+                    crosses_fill_border(m_triangles[current_facet].source_triangle, m_triangles[tr_idx].source_triangle))
+                    continue;
+
                 assert(!m_triangles[tr_idx].is_split());
                 facet_queue.push(tr_idx);
             }
@@ -610,6 +617,177 @@ void TriangleSelector::bucket_fill_select_triangles(const Vec3f& hit, int facet_
 
         visited[current_facet] = true;
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Border line tool (colour painting): user-drawn borders that bucket fill does not cross, and a path search
+// that snaps a line between two clicked vertices to the mesh's sharp edges and grooves.
+
+static uint64_t fill_border_key(int v0, int v1)
+{
+    if (v0 > v1)
+        std::swap(v0, v1);
+    return (uint64_t(uint32_t(v0)) << 32) | uint64_t(uint32_t(v1));
+}
+
+void TriangleSelector::add_fill_border(const std::vector<int> &vertex_path)
+{
+    for (size_t i = 1; i < vertex_path.size(); ++i)
+        if (vertex_path[i - 1] != vertex_path[i])
+            m_fill_borders.insert(fill_border_key(vertex_path[i - 1], vertex_path[i]));
+}
+
+void TriangleSelector::remove_fill_border(const std::vector<int> &vertex_path)
+{
+    for (size_t i = 1; i < vertex_path.size(); ++i)
+        m_fill_borders.erase(fill_border_key(vertex_path[i - 1], vertex_path[i]));
+}
+
+bool TriangleSelector::is_fill_border(int v0, int v1) const
+{
+    return m_fill_borders.count(fill_border_key(v0, v1)) != 0;
+}
+
+std::vector<std::pair<int, int>> TriangleSelector::fill_border_edges() const
+{
+    std::vector<std::pair<int, int>> edges;
+    edges.reserve(m_fill_borders.size());
+    for (uint64_t key : m_fill_borders)
+        edges.emplace_back(int(key >> 32), int(key & 0xffffffffu));
+    return edges;
+}
+
+bool TriangleSelector::crosses_fill_border(int source_triangle_a, int source_triangle_b) const
+{
+    if (source_triangle_a == source_triangle_b)
+        return false; // pieces of one original triangle never have a border between them
+    const stl_triangle_vertex_indices &a = m_mesh.its.indices[source_triangle_a];
+    const stl_triangle_vertex_indices &b = m_mesh.its.indices[source_triangle_b];
+    int shared[2];
+    int count = 0;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            if (a[i] == b[j] && count < 2)
+                shared[count++] = a[i];
+    return count == 2 && is_fill_border(shared[0], shared[1]);
+}
+
+int TriangleSelector::nearest_original_vertex(int facet_idx, const Vec3f &point) const
+{
+    if (facet_idx < 0 || facet_idx >= int(m_mesh.its.indices.size()))
+        return -1;
+    const stl_triangle_vertex_indices &tri = m_mesh.its.indices[facet_idx];
+    int   best      = tri[0];
+    float best_dist = (m_mesh.its.vertices[tri[0]] - point).squaredNorm();
+    for (int i = 1; i < 3; ++i) {
+        float dist = (m_mesh.its.vertices[tri[i]] - point).squaredNorm();
+        if (dist < best_dist) {
+            best_dist = dist;
+            best      = tri[i];
+        }
+    }
+    return best;
+}
+
+std::vector<int> TriangleSelector::snapped_edge_path(int from_vertex, int to_vertex, float snap_sigma_deg, float corridor_factor) const
+{
+    const indexed_triangle_set &its = m_mesh.its;
+    const int vertex_count = int(its.vertices.size());
+    if (from_vertex < 0 || to_vertex < 0 || from_vertex >= vertex_count || to_vertex >= vertex_count)
+        return {};
+    if (from_vertex == to_vertex)
+        return {from_vertex};
+
+    // Only vertices inside a sphere around the two ends take part, which keeps each search quick.
+    const Vec3f  &p_from = its.vertices[from_vertex];
+    const Vec3f  &p_to   = its.vertices[to_vertex];
+    const Vec3f   centre = 0.5f * (p_from + p_to);
+    const float   radius = std::max(1.f, corridor_factor) * 0.5f * (p_to - p_from).norm() + 2.f;
+    const float   radius_sqr = radius * radius;
+    auto inside = [&](int v) { return (its.vertices[v] - centre).squaredNorm() <= radius_sqr; };
+
+    // Local graph: edges of triangles that have all three corners inside the sphere.
+    std::unordered_map<int, int>                    local_of;   // mesh vertex -> local index
+    std::vector<int>                                mesh_of;    // local index -> mesh vertex
+    std::vector<std::vector<std::pair<int, float>>> adjacency;  // local index -> (local neighbour, cost)
+    auto local = [&](int v) {
+        auto [it, added] = local_of.emplace(v, int(mesh_of.size()));
+        if (added) {
+            mesh_of.push_back(v);
+            adjacency.emplace_back();
+        }
+        return it->second;
+    };
+    for (int t = 0; t < int(its.indices.size()); ++t) {
+        const stl_triangle_vertex_indices &tri = its.indices[t];
+        if (!inside(tri[0]) || !inside(tri[1]) || !inside(tri[2]))
+            continue;
+        for (int e = 0; e < 3; ++e) {
+            const int v0 = tri[e], v1 = tri[(e + 1) % 3];
+            // Find the neighbouring triangle across this edge, for the bend between the two.
+            float strength = 0.f;
+            for (int n : m_neighbors[t]) {
+                if (n < 0)
+                    continue;
+                const stl_triangle_vertex_indices &other = its.indices[n];
+                int far = -1, matches = 0;
+                for (int k = 0; k < 3; ++k) {
+                    if (other[k] == v0 || other[k] == v1)
+                        ++matches;
+                    else
+                        far = other[k];
+                }
+                if (matches != 2 || far < 0)
+                    continue;
+                const Vec3f &n_t = m_face_normals[t];
+                const Vec3f &n_n = m_face_normals[n];
+                const float  angle = float(Geometry::rad2deg(std::acos(std::clamp(n_t.dot(n_n), -1.f, 1.f))));
+                // Concave (a groove) when the neighbour's far corner lies in front of this triangle.
+                const bool concave = n_t.dot(its.vertices[far] - its.vertices[v0]) > 0.f;
+                strength = concave ? 2.f * angle : angle;
+                break;
+            }
+            const float length = (its.vertices[v1] - its.vertices[v0]).norm();
+            const float cost   = snap_sigma_deg > 0.f ? length * (0.02f + std::exp(-strength / snap_sigma_deg)) : length;
+            const int   a = local(v0), b = local(v1);
+            adjacency[a].emplace_back(b, cost);
+            adjacency[b].emplace_back(a, cost);
+        }
+    }
+    auto from_it = local_of.find(from_vertex);
+    auto to_it   = local_of.find(to_vertex);
+    if (from_it == local_of.end() || to_it == local_of.end())
+        return {};
+
+    // Dijkstra from `from` to `to`.
+    const int source = from_it->second, target = to_it->second;
+    std::vector<float> distance(mesh_of.size(), std::numeric_limits<float>::infinity());
+    std::vector<int>   previous(mesh_of.size(), -1);
+    using Entry = std::pair<float, int>;
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> queue;
+    distance[source] = 0.f;
+    queue.emplace(0.f, source);
+    while (!queue.empty()) {
+        auto [d, u] = queue.top();
+        queue.pop();
+        if (d > distance[u])
+            continue;
+        if (u == target)
+            break;
+        for (const auto &[w, cost] : adjacency[u])
+            if (d + cost < distance[w]) {
+                distance[w] = d + cost;
+                previous[w] = u;
+                queue.emplace(distance[w], w);
+            }
+    }
+    if (previous[target] < 0)
+        return {};
+    std::vector<int> path;
+    for (int u = target; u >= 0; u = previous[u])
+        path.push_back(mesh_of[u]);
+    std::reverse(path.begin(), path.end());
+    return path;
 }
 
 // Selects either the whole triangle (discarding any children it had), or divides

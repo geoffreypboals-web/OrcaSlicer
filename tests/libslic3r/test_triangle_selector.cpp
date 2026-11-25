@@ -11,6 +11,8 @@
 #include <vector>
 #include <cstddef>
 #include <string>
+#include <cfloat>
+#include <cmath>
 
 using namespace Slic3r;
 
@@ -205,4 +207,150 @@ TEST_CASE("A truncated or malformed paint stream drops only the damaged triangle
     recomputed.reset_used_states();
     REQUIRE_FALSE(recomputed.update_used_states(0));
     REQUIRE(std::none_of(recomputed.used_states.begin(), recomputed.used_states.end(), [](bool used) { return used; }));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Border line tool (colour painting): borders stop bucket fill; snapped paths follow sharp edges and grooves.
+
+// An open n x n grid of square cells (each split into two upward-facing triangles), `cell` mm apart. Vertices with
+// raise_from <= x, y <= raise_to (in mm) are lifted by `raise_height`, which gives a raised square block whose
+// walls slope over one cell.
+static TriangleMesh grid_mesh(int n, float cell, float raise_from = 0.f, float raise_to = -1.f, float raise_height = 0.f)
+{
+    indexed_triangle_set its;
+    for (int j = 0; j < n; ++j)
+        for (int i = 0; i < n; ++i) {
+            const float x = i * cell, y = j * cell;
+            const bool  raised = x >= raise_from - 1e-4f && x <= raise_to + 1e-4f && y >= raise_from - 1e-4f && y <= raise_to + 1e-4f;
+            its.vertices.emplace_back(x, y, raised ? raise_height : 0.f);
+        }
+    auto idx = [n](int i, int j) { return j * n + i; };
+    for (int j = 0; j + 1 < n; ++j)
+        for (int i = 0; i + 1 < n; ++i) {
+            its.indices.emplace_back(idx(i, j), idx(i + 1, j), idx(i + 1, j + 1));
+            its.indices.emplace_back(idx(i, j), idx(i + 1, j + 1), idx(i, j + 1));
+        }
+    return TriangleMesh(its);
+}
+
+// Index of the grid vertex at (x, y) mm.
+static int grid_vertex(int n, float cell, float x, float y) { return int(std::lround(y / cell)) * n + int(std::lround(x / cell)); }
+
+// Fill from the triangle whose centre is nearest `point`, edge detection off, and return how many triangles it took.
+static int fill_count(TriangleSelector &selector, const TriangleMesh &mesh, const Vec3f &point)
+{
+    int   best = 0;
+    float best_dist = FLT_MAX;
+    for (int t = 0; t < int(mesh.its.indices.size()); ++t) {
+        const auto &tri    = mesh.its.indices[t];
+        const Vec3f centre = (mesh.its.vertices[tri[0]] + mesh.its.vertices[tri[1]] + mesh.its.vertices[tri[2]]) / 3.f;
+        if ((centre - point).squaredNorm() < best_dist) {
+            best_dist = (centre - point).squaredNorm();
+            best      = t;
+        }
+    }
+    const auto &tri    = mesh.its.indices[best];
+    const Vec3f centre = (mesh.its.vertices[tri[0]] + mesh.its.vertices[tri[1]] + mesh.its.vertices[tri[2]]) / 3.f;
+    selector.seed_fill_unselect_all_triangles();
+    selector.bucket_fill_select_triangles(centre, best, TriangleSelector::ClippingPlane(), -1.f, true, true);
+    selector.seed_fill_apply_on_triangles(EnforcerBlockerType::Extruder2);
+    const int count = selector.num_facets(EnforcerBlockerType::Extruder2);
+    selector.reset();
+    return count;
+}
+
+TEST_CASE("Bucket fill stops at a closed fill border", "[TriangleSelector][BorderLine]")
+{
+    const int   n    = 21; // 20 x 20 cells of 1 mm = 800 triangles
+    const float cell = 1.f;
+    const TriangleMesh mesh = grid_mesh(n, cell);
+    TriangleSelector   selector(mesh);
+    REQUIRE(fill_count(selector, mesh, Vec3f(10.f, 10.f, 0.f)) == 800);
+
+    // A closed square border along the grid lines x = 5, x = 15, y = 5, y = 15.
+    std::vector<int> loop;
+    for (int i = 5; i <= 15; ++i) loop.push_back(grid_vertex(n, cell, float(i), 5.f));
+    for (int j = 6; j <= 15; ++j) loop.push_back(grid_vertex(n, cell, 15.f, float(j)));
+    for (int i = 14; i >= 5; --i) loop.push_back(grid_vertex(n, cell, float(i), 15.f));
+    for (int j = 14; j >= 5; --j) loop.push_back(grid_vertex(n, cell, 5.f, float(j)));
+    selector.add_fill_border(loop);
+    REQUIRE(selector.has_fill_borders());
+    CHECK(selector.fill_border_edges().size() == 40);
+
+    // reset() clears paint but keeps borders, so both sides can be measured with the same borders.
+    CHECK(fill_count(selector, mesh, Vec3f(10.f, 10.f, 0.f)) == 200); // inside: 10 x 10 cells
+    CHECK(fill_count(selector, mesh, Vec3f(1.f, 1.f, 0.f)) == 600);   // outside
+
+    SECTION("removing the border lets fill through again") {
+        selector.remove_fill_border(loop);
+        CHECK_FALSE(selector.has_fill_borders());
+        CHECK(fill_count(selector, mesh, Vec3f(10.f, 10.f, 0.f)) == 800);
+    }
+}
+
+TEST_CASE("Fill borders do not change serialized paint", "[TriangleSelector][BorderLine]")
+{
+    const TriangleMesh mesh = grid_mesh(11, 1.f);
+    TriangleSelector   selector(mesh);
+    selector.set_facet(3, EnforcerBlockerType::Extruder3);
+    const auto before = selector.serialize();
+    selector.add_fill_border({0, 1, 2, 3});
+    CHECK(selector.serialize() == before);
+    selector.clear_fill_borders();
+    CHECK(selector.serialize() == before);
+}
+
+TEST_CASE("Snapped path follows the edges of a raised block", "[TriangleSelector][BorderLine]")
+{
+    // 0.5 mm cells; a 0.5 mm high block from 5 to 15 mm whose walls slope over one cell (4.5 -> 5 mm).
+    const int   n    = 41;
+    const float cell = 0.5f;
+    const TriangleMesh mesh = grid_mesh(n, cell, 5.f, 15.f, 0.5f);
+    TriangleSelector   selector(mesh);
+
+    // From a point on the block's bottom edge to a point on its right edge: the snapped path goes round the
+    // corner at (15, 5). The grid's diagonals run in the +x+y direction, so the plain shortest path cuts across
+    // the top of the block instead (no tie between the two).
+    const int from = grid_vertex(n, cell, 10.f, 5.f);
+    const int to   = grid_vertex(n, cell, 15.f, 10.f);
+    auto on_block_edge = [&](int v) {
+        const Vec3f &p = selector.original_vertex(v);
+        const bool right_side  = std::abs(p.x() - 15.f) < 1e-3f || std::abs(p.x() - 15.5f) < 1e-3f;
+        const bool bottom_side = std::abs(p.y() - 5.f) < 1e-3f || std::abs(p.y() - 4.5f) < 1e-3f;
+        return (right_side && p.y() > 4.4f) || (bottom_side && p.x() < 15.6f);
+    };
+    auto share_on_edge = [&](const std::vector<int> &path) {
+        float total = 0.f, good = 0.f;
+        for (size_t i = 1; i < path.size(); ++i) {
+            const float length = (selector.original_vertex(path[i]) - selector.original_vertex(path[i - 1])).norm();
+            total += length;
+            if (on_block_edge(path[i]) && on_block_edge(path[i - 1]))
+                good += length;
+        }
+        return total > 0.f ? good / total : 0.f;
+    };
+
+    const std::vector<int> snapped = selector.snapped_edge_path(from, to, 20.f);
+    REQUIRE(snapped.size() >= 2);
+    CHECK(snapped.front() == from);
+    CHECK(snapped.back() == to);
+    CHECK(share_on_edge(snapped) >= 0.95f);
+
+    const std::vector<int> shortest = selector.snapped_edge_path(from, to, 0.f);
+    REQUIRE(shortest.size() >= 2);
+    CHECK(share_on_edge(shortest) < 0.6f); // the plain shortest path cuts across the top
+
+    SECTION("no path between unconnected parts") {
+        CHECK(selector.snapped_edge_path(from, from, 20.f) == std::vector<int>{from});
+        CHECK(selector.snapped_edge_path(from, -1, 20.f).empty());
+    }
+}
+
+TEST_CASE("Nearest original vertex of a clicked triangle", "[TriangleSelector][BorderLine]")
+{
+    const TriangleMesh mesh = grid_mesh(3, 1.f);
+    TriangleSelector   selector(mesh);
+    const auto &tri = mesh.its.indices[0];
+    CHECK(selector.nearest_original_vertex(0, mesh.its.vertices[tri[1]] + Vec3f(0.01f, 0.f, 0.f)) == tri[1]);
+    CHECK(selector.nearest_original_vertex(-1, Vec3f::Zero()) == -1);
 }

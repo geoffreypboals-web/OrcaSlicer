@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include <unordered_set>
 #include <memory>
 #include <utility>
 #include <optional>
@@ -369,6 +370,30 @@ public:
                                       bool                 propagate,                  // if bucket fill is propagated to neighbor faces or if it fills the only facet of the modified mesh that the hit point belongs to.
                                       bool                 force_reselection = false); // force reselection of the triangle mesh even in cases that mouse is pointing on the selected triangle
 
+    // Border line tool (colour painting). A border is a chain of edges of the original mesh that bucket fill
+    // never crosses. Borders are working aids: they are not serialized and do not change any paint by themselves.
+    // `vertex_path` lists original-mesh vertex indices; consecutive entries must share an edge.
+    void add_fill_border(const std::vector<int> &vertex_path);
+    // Removes every border edge that `vertex_path` added (used to delete one drawn line).
+    void remove_fill_border(const std::vector<int> &vertex_path);
+    void clear_fill_borders() { m_fill_borders.clear(); }
+    bool has_fill_borders() const { return !m_fill_borders.empty(); }
+    // True if the original-mesh edge between vertices v0 and v1 is part of a border.
+    bool is_fill_border(int v0, int v1) const;
+    // All border edges as pairs of original-mesh vertex indices (for drawing).
+    std::vector<std::pair<int, int>> fill_border_edges() const;
+    // Cheapest path along original-mesh edges from vertex `from_vertex` to `to_vertex`. Each edge costs
+    // length * (0.02 + exp(-strength / snap_sigma_deg)), where strength is the dihedral angle between the
+    // edge's two triangles in degrees, doubled when the edge is concave (a groove), so the path prefers to
+    // run along sharp edges and grooves. snap_sigma_deg <= 0 gives the plain shortest path. The search is
+    // limited to vertices within a sphere around the two ends (corridor_factor x half their distance, plus
+    // 2 mm). Returns the vertex indices from `from_vertex` to `to_vertex`, or an empty vector if no path.
+    std::vector<int> snapped_edge_path(int from_vertex, int to_vertex, float snap_sigma_deg, float corridor_factor = 3.f) const;
+    // Original-mesh vertex of triangle `facet_idx` nearest to `point` (mesh coordinates).
+    int nearest_original_vertex(int facet_idx, const Vec3f &point) const;
+    // Position of an original-mesh vertex (mesh coordinates).
+    const Vec3f &original_vertex(int vertex_idx) const { return m_mesh.its.vertices[vertex_idx]; }
+
     bool                 has_facets(EnforcerBlockerType state) const;
     static bool          has_facets(const TriangleSplittingData &data, EnforcerBlockerType test_state);
     int                  num_facets(EnforcerBlockerType state) const;
@@ -543,6 +568,12 @@ protected:
     // Number of original vertices and triangles.
     int m_orig_size_vertices = 0;
     int m_orig_size_indices = 0;
+
+    // Border line tool: original-mesh edges (smaller vertex index first, packed into 64 bits) that bucket
+    // fill must not cross. Not serialized.
+    std::unordered_set<uint64_t> m_fill_borders;
+    // True if the two original triangles share an edge that is a fill border.
+    bool crosses_fill_border(int source_triangle_a, int source_triangle_b) const;
 
     std::unique_ptr<Cursor> m_cursor;
     // Zero indicates an uninitialized state.
